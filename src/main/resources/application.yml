@@ -1,0 +1,30 @@
+spring:
+  application:
+    name: clusterpulse
+
+  data:
+    mongodb:
+      uri: mongodb://localhost:27017/clusterpulse
+      auto-index-creation: true
+
+server:
+  port: 8080
+
+springdoc:
+  api-docs:
+    path: /api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+# ClusterPulse custom config
+clusterpulse:
+  polling:
+    interval-seconds: 30
+    initial-delay-seconds: 10
+  alerts:
+    evaluation-interval-seconds: 15
+  remediation:
+    enabled: false  # Safety: disabled by default, enable per-cluster
+    dry-run: true   # Log actions without executing
+  health:
+    snapshot-retention-hours: 72
