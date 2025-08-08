@@ -1,0 +1,39 @@
+# Build output
+target/
+*.class
+*.jar
+*.war
+*.ear
+
+# Logs
+*.log
+
+# IDE files
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+*.swp
+*.swo
+.project
+.classpath
+.settings/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.local
+application-local.yml
+application-secret.yml
+
+# Maven wrapper (if not committed intentionally)
+# mvnw
+# mvnw.cmd
+# .mvn/
+
+# Spring Boot devtools restart file
+.reloadtrigger
