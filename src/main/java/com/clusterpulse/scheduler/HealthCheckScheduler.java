@@ -7,29 +7,49 @@ import com.clusterpulse.service.AlertEngineService;
 import com.clusterpulse.service.ClusterRegistryService;
 import com.clusterpulse.service.HealthPollerService;
 import com.clusterpulse.service.RemediationService;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Orchestrates the periodic health check pipeline:
- *   1. Poll each registered cluster for health metrics
+ *   1. Poll each registered cluster for health metrics — in parallel
  *   2. Update the cluster's status in the registry
  *   3. Evaluate alert rules against the new snapshot
  *   4. Trigger remediation for critical alerts (if enabled)
+ *
+ * Clusters are polled concurrently using a dedicated executor so that a slow
+ * or unreachable cluster does not delay polling for healthy ones.
  */
 @Slf4j
 @Component
-@RequiredArgsConstructor
 public class HealthCheckScheduler {
 
     private final ClusterRegistryService clusterRegistryService;
     private final HealthPollerService healthPollerService;
     private final AlertEngineService alertEngineService;
     private final RemediationService remediationService;
+    private final Executor pollExecutor;
+
+    public HealthCheckScheduler(ClusterRegistryService clusterRegistryService,
+                                 HealthPollerService healthPollerService,
+                                 AlertEngineService alertEngineService,
+                                 RemediationService remediationService,
+                                 @Qualifier("clusterPollExecutor") Executor pollExecutor) {
+        this.clusterRegistryService = clusterRegistryService;
+        this.healthPollerService = healthPollerService;
+        this.alertEngineService = alertEngineService;
+        this.remediationService = remediationService;
+        this.pollExecutor = pollExecutor;
+    }
 
     @Scheduled(
             fixedDelayString = "${clusterpulse.polling.interval-seconds:30}000",
@@ -43,44 +63,52 @@ public class HealthCheckScheduler {
             return;
         }
 
-        log.info("Starting health check cycle for {} cluster(s)", clusters.size());
+        log.info("Starting health check cycle for {} cluster(s) in parallel", clusters.size());
 
-        for (Cluster cluster : clusters) {
-            try {
-                processCluster(cluster);
-            } catch (Exception e) {
-                log.error("Unexpected error processing cluster {}: {}",
-                        cluster.getDisplayName(), e.getMessage(), e);
-            }
+        List<CompletableFuture<Void>> futures = clusters.stream()
+                .map(cluster -> CompletableFuture.runAsync(
+                        () -> processCluster(cluster), pollExecutor))
+                .toList();
+
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                    .get(60, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            log.warn("Health check cycle timed out after 60s — some clusters may not have been polled");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("Health check cycle was interrupted", e);
+        } catch (ExecutionException e) {
+            log.error("Unexpected error during health check cycle", e.getCause());
         }
 
         log.info("Health check cycle complete");
     }
 
     private void processCluster(Cluster cluster) {
-        // Step 1: Poll health metrics
-        HealthSnapshot snapshot = healthPollerService.pollCluster(cluster);
+        try {
+            HealthSnapshot snapshot = healthPollerService.pollCluster(cluster);
 
-        // Step 2: Update cluster status
-        clusterRegistryService.updateClusterHealth(
-                cluster.getId(),
-                snapshot.getComputedStatus(),
-                cluster.getReplicaSetName(),
-                snapshot.getMembers() != null ? snapshot.getMembers().size() : 0,
-                cluster.getPrimaryHost(),
-                cluster.getMongoVersion()
-        );
+            clusterRegistryService.updateClusterHealth(
+                    cluster.getId(),
+                    snapshot.getComputedStatus(),
+                    cluster.getReplicaSetName(),
+                    snapshot.getMembers() != null ? snapshot.getMembers().size() : 0,
+                    cluster.getPrimaryHost(),
+                    cluster.getMongoVersion()
+            );
 
-        // Step 3: Evaluate alert rules
-        List<Alert> firedAlerts = alertEngineService.evaluateRules(
-                cluster.getId(), snapshot);
+            List<Alert> firedAlerts = alertEngineService.evaluateRules(
+                    cluster.getId(), snapshot);
 
-        if (!firedAlerts.isEmpty()) {
-            log.warn("Cluster {} fired {} alert(s)",
-                    cluster.getDisplayName(), firedAlerts.size());
-
-            // Step 4: Auto-remediation (if enabled)
-            remediationService.evaluateAndRemediate(cluster, firedAlerts);
+            if (!firedAlerts.isEmpty()) {
+                log.warn("Cluster {} fired {} alert(s)",
+                        cluster.getDisplayName(), firedAlerts.size());
+                remediationService.evaluateAndRemediate(cluster, firedAlerts);
+            }
+        } catch (Exception e) {
+            log.error("Unexpected error processing cluster {}: {}",
+                    cluster.getDisplayName(), e.getMessage(), e);
         }
     }
 }
