@@ -17,12 +17,17 @@ import org.springframework.stereotype.Service;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 /**
  * Polls health metrics from target MongoDB replica sets by executing
  * admin commands (replSetGetStatus, serverStatus) against each registered cluster.
  * This mirrors how Atlas's cluster management layer monitors deployments.
+ *
+ * MongoClientSettings objects are cached per connection URI. Since settings are
+ * immutable and tied only to the URI (not per-poll state), rebuilding them on
+ * every tick is wasteful — especially under parallel polling.
  */
 @Slf4j
 @Service
@@ -30,6 +35,9 @@ import java.util.concurrent.TimeUnit;
 public class HealthPollerService {
 
     private final HealthSnapshotRepository snapshotRepository;
+
+    private final ConcurrentHashMap<String, MongoClientSettings> settingsCache =
+            new ConcurrentHashMap<>();
 
     /**
      * Connects to a target cluster, collects health metrics, and persists a snapshot.
@@ -39,14 +47,7 @@ public class HealthPollerService {
         log.debug("Polling cluster: {} ({})", cluster.getDisplayName(), cluster.getId());
 
         try {
-            MongoClientSettings settings = MongoClientSettings.builder()
-                    .applyConnectionString(new ConnectionString(cluster.getConnectionUri()))
-                    .applyToSocketSettings(builder ->
-                            builder.connectTimeout(5, TimeUnit.SECONDS)
-                                   .readTimeout(10, TimeUnit.SECONDS))
-                    .applyToClusterSettings(builder ->
-                            builder.serverSelectionTimeout(5, TimeUnit.SECONDS))
-                    .build();
+            MongoClientSettings settings = getOrBuildSettings(cluster.getConnectionUri());
 
             try (MongoClient client = MongoClients.create(settings)) {
                 MongoDatabase adminDb = client.getDatabase("admin");
@@ -118,7 +119,6 @@ public class HealthPollerService {
             }
 
             // Count voting members
-            Document memberConfig = member.get("configVersion") != null ? member : null;
             totalVoting++;
             if (healthy && (state == 1 || state == 2)) {
                 votingUp++;
@@ -167,6 +167,18 @@ public class HealthPollerService {
                 .members(members)
                 .computedStatus(computedStatus)
                 .build();
+    }
+
+    private MongoClientSettings getOrBuildSettings(String connectionUri) {
+        return settingsCache.computeIfAbsent(connectionUri, uri ->
+                MongoClientSettings.builder()
+                        .applyConnectionString(new ConnectionString(uri))
+                        .applyToSocketSettings(b ->
+                                b.connectTimeout(5, TimeUnit.SECONDS)
+                                 .readTimeout(10, TimeUnit.SECONDS))
+                        .applyToClusterSettings(b ->
+                                b.serverSelectionTimeout(5, TimeUnit.SECONDS))
+                        .build());
     }
 
     private Cluster.ClusterStatus computeStatus(long maxLagMs, double connUtil,
