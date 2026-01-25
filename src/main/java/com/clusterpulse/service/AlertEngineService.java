@@ -12,11 +12,15 @@ import org.springframework.stereotype.Service;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 /**
  * Evaluates configured alert rules against the latest health snapshot
  * for each cluster. Supports cooldown windows to prevent alert storms.
+ *
+ * Alert and rule timestamp writes are batched into a single saveAll call each
+ * so that N firing rules produce 2 round-trips instead of 2N.
  */
 @Slf4j
 @Service
@@ -28,7 +32,13 @@ public class AlertEngineService {
 
     public List<Alert> evaluateRules(String clusterId, HealthSnapshot snapshot) {
         List<AlertRule> rules = ruleRepository.findByClusterIdAndEnabled(clusterId, true);
-        List<Alert> firedAlerts = new ArrayList<>();
+
+        if (rules.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        List<Alert> toFire = new ArrayList<>();
+        List<AlertRule> firedRules = new ArrayList<>();
 
         for (AlertRule rule : rules) {
             if (isInCooldown(rule)) {
@@ -40,15 +50,39 @@ public class AlertEngineService {
             boolean breached = evaluateThreshold(actualValue, rule.getComparator(), rule.getThreshold());
 
             if (breached) {
-                Alert alert = fireAlert(clusterId, rule, actualValue);
-                firedAlerts.add(alert);
+                rule.setLastFiredAt(Instant.now());
+                firedRules.add(rule);
+
+                String message = String.format("[%s] %s: actual=%.2f, threshold=%.2f (%s)",
+                        rule.getSeverity(), rule.getRuleName(), actualValue,
+                        rule.getThreshold(), rule.getComparator());
+
+                toFire.add(Alert.builder()
+                        .clusterId(clusterId)
+                        .ruleId(rule.getId())
+                        .ruleName(rule.getRuleName())
+                        .severity(rule.getSeverity())
+                        .metricType(rule.getMetricType())
+                        .actualValue(actualValue)
+                        .thresholdValue(rule.getThreshold())
+                        .message(message)
+                        .status(Alert.AlertStatus.OPEN)
+                        .firedAt(Instant.now())
+                        .build());
+
                 log.warn("Alert fired: {} | cluster={} | actual={} {} threshold={}",
                         rule.getRuleName(), clusterId, actualValue,
                         rule.getComparator(), rule.getThreshold());
             }
         }
 
-        return firedAlerts;
+        if (toFire.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        // Two round-trips regardless of how many rules fired
+        ruleRepository.saveAll(firedRules);
+        return alertRepository.saveAll(toFire);
     }
 
     public double extractMetricValue(HealthSnapshot snapshot, AlertRule.MetricType metricType) {
@@ -78,31 +112,6 @@ public class AlertEngineService {
         if (rule.getLastFiredAt() == null) return false;
         Duration elapsed = Duration.between(rule.getLastFiredAt(), Instant.now());
         return elapsed.toMinutes() < rule.getCooldownMinutes();
-    }
-
-    private Alert fireAlert(String clusterId, AlertRule rule, double actualValue) {
-        // Update rule's last fired timestamp
-        rule.setLastFiredAt(Instant.now());
-        ruleRepository.save(rule);
-
-        String message = String.format("[%s] %s: actual=%.2f, threshold=%.2f (%s)",
-                rule.getSeverity(), rule.getRuleName(), actualValue,
-                rule.getThreshold(), rule.getComparator());
-
-        Alert alert = Alert.builder()
-                .clusterId(clusterId)
-                .ruleId(rule.getId())
-                .ruleName(rule.getRuleName())
-                .severity(rule.getSeverity())
-                .metricType(rule.getMetricType())
-                .actualValue(actualValue)
-                .thresholdValue(rule.getThreshold())
-                .message(message)
-                .status(Alert.AlertStatus.OPEN)
-                .firedAt(Instant.now())
-                .build();
-
-        return alertRepository.save(alert);
     }
 
     public Alert acknowledgeAlert(String alertId, String acknowledgedBy) {
