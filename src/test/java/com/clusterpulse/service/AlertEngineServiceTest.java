@@ -10,7 +10,6 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -22,6 +21,7 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.*;
 
 @ExtendWith(MockitoExtension.class)
@@ -73,22 +73,12 @@ class AlertEngineServiceTest {
     @Test
     @DisplayName("Should fire alert when replication lag exceeds threshold")
     void shouldFireAlertOnHighReplicationLag() {
-        AlertRule rule = AlertRule.builder()
-                .id("rule-1")
-                .clusterId("cluster-1")
-                .ruleName("High Replication Lag")
-                .metricType(AlertRule.MetricType.REPLICATION_LAG_MS)
-                .comparator(AlertRule.Comparator.GREATER_THAN)
-                .threshold(10000)
-                .severity(AlertRule.Severity.WARNING)
-                .enabled(true)
-                .cooldownMinutes(5)
-                .build();
+        AlertRule rule = lagRule("rule-1", 10000, AlertRule.Severity.WARNING);
 
         when(ruleRepository.findByClusterIdAndEnabled("cluster-1", true))
                 .thenReturn(List.of(rule));
-        when(ruleRepository.save(any(AlertRule.class))).thenReturn(rule);
-        when(alertRepository.save(any(Alert.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(ruleRepository.saveAll(anyList())).thenReturn(List.of(rule));
+        when(alertRepository.saveAll(anyList())).thenAnswer(inv -> inv.getArgument(0));
 
         List<Alert> alerts = alertEngineService.evaluateRules("cluster-1", degradedSnapshot);
 
@@ -96,22 +86,15 @@ class AlertEngineServiceTest {
         assertEquals("High Replication Lag", alerts.get(0).getRuleName());
         assertEquals(AlertRule.Severity.WARNING, alerts.get(0).getSeverity());
         assertEquals(15000, alerts.get(0).getActualValue());
+        // Batch persistence: saveAll called once, not individual save
+        verify(alertRepository, times(1)).saveAll(anyList());
+        verify(alertRepository, never()).save(any());
     }
 
     @Test
     @DisplayName("Should not fire alert when metric is within threshold")
     void shouldNotFireAlertWhenHealthy() {
-        AlertRule rule = AlertRule.builder()
-                .id("rule-1")
-                .clusterId("cluster-1")
-                .ruleName("High Replication Lag")
-                .metricType(AlertRule.MetricType.REPLICATION_LAG_MS)
-                .comparator(AlertRule.Comparator.GREATER_THAN)
-                .threshold(10000)
-                .severity(AlertRule.Severity.WARNING)
-                .enabled(true)
-                .cooldownMinutes(5)
-                .build();
+        AlertRule rule = lagRule("rule-1", 10000, AlertRule.Severity.WARNING);
 
         when(ruleRepository.findByClusterIdAndEnabled("cluster-1", true))
                 .thenReturn(List.of(rule));
@@ -119,24 +102,27 @@ class AlertEngineServiceTest {
         List<Alert> alerts = alertEngineService.evaluateRules("cluster-1", healthySnapshot);
 
         assertEquals(0, alerts.size());
+        verify(alertRepository, never()).saveAll(anyList());
         verify(alertRepository, never()).save(any());
+    }
+
+    @Test
+    @DisplayName("Should return empty list immediately when cluster has no enabled rules")
+    void shouldReturnEmptyWhenNoRules() {
+        when(ruleRepository.findByClusterIdAndEnabled("cluster-1", true))
+                .thenReturn(List.of());
+
+        List<Alert> alerts = alertEngineService.evaluateRules("cluster-1", degradedSnapshot);
+
+        assertTrue(alerts.isEmpty());
+        verify(alertRepository, never()).saveAll(anyList());
     }
 
     @Test
     @DisplayName("Should skip rule during cooldown period")
     void shouldSkipRuleDuringCooldown() {
-        AlertRule rule = AlertRule.builder()
-                .id("rule-1")
-                .clusterId("cluster-1")
-                .ruleName("High Replication Lag")
-                .metricType(AlertRule.MetricType.REPLICATION_LAG_MS)
-                .comparator(AlertRule.Comparator.GREATER_THAN)
-                .threshold(10000)
-                .severity(AlertRule.Severity.WARNING)
-                .enabled(true)
-                .cooldownMinutes(5)
-                .lastFiredAt(Instant.now().minus(2, ChronoUnit.MINUTES))  // Fired 2 min ago
-                .build();
+        AlertRule rule = lagRule("rule-1", 10000, AlertRule.Severity.WARNING);
+        rule.setLastFiredAt(Instant.now().minus(2, ChronoUnit.MINUTES)); // fired 2 min ago, cooldown=5
 
         when(ruleRepository.findByClusterIdAndEnabled("cluster-1", true))
                 .thenReturn(List.of(rule));
@@ -144,33 +130,48 @@ class AlertEngineServiceTest {
         List<Alert> alerts = alertEngineService.evaluateRules("cluster-1", degradedSnapshot);
 
         assertEquals(0, alerts.size());
-        verify(alertRepository, never()).save(any());
+        verify(alertRepository, never()).saveAll(anyList());
     }
 
     @Test
     @DisplayName("Should fire after cooldown expires")
     void shouldFireAfterCooldownExpires() {
-        AlertRule rule = AlertRule.builder()
-                .id("rule-1")
-                .clusterId("cluster-1")
-                .ruleName("High Replication Lag")
-                .metricType(AlertRule.MetricType.REPLICATION_LAG_MS)
-                .comparator(AlertRule.Comparator.GREATER_THAN)
-                .threshold(10000)
-                .severity(AlertRule.Severity.WARNING)
-                .enabled(true)
-                .cooldownMinutes(5)
-                .lastFiredAt(Instant.now().minus(10, ChronoUnit.MINUTES))  // Fired 10 min ago
-                .build();
+        AlertRule rule = lagRule("rule-1", 10000, AlertRule.Severity.WARNING);
+        rule.setLastFiredAt(Instant.now().minus(10, ChronoUnit.MINUTES)); // fired 10 min ago
 
         when(ruleRepository.findByClusterIdAndEnabled("cluster-1", true))
                 .thenReturn(List.of(rule));
-        when(ruleRepository.save(any(AlertRule.class))).thenReturn(rule);
-        when(alertRepository.save(any(Alert.class))).thenAnswer(inv -> inv.getArgument(0));
+        when(ruleRepository.saveAll(anyList())).thenReturn(List.of(rule));
+        when(alertRepository.saveAll(anyList())).thenAnswer(inv -> inv.getArgument(0));
 
         List<Alert> alerts = alertEngineService.evaluateRules("cluster-1", degradedSnapshot);
 
         assertEquals(1, alerts.size());
+    }
+
+    @Test
+    @DisplayName("Multiple firing rules should be batched into a single saveAll call")
+    void shouldBatchMultipleFiringRulesIntoOneSaveAll() {
+        AlertRule lagRule = lagRule("rule-1", 10000, AlertRule.Severity.WARNING);
+        AlertRule connRule = AlertRule.builder()
+                .id("rule-2").clusterId("cluster-1")
+                .ruleName("High Connections")
+                .metricType(AlertRule.MetricType.CONNECTION_UTILIZATION_PCT)
+                .comparator(AlertRule.Comparator.GREATER_THAN)
+                .threshold(80.0).severity(AlertRule.Severity.CRITICAL)
+                .enabled(true).cooldownMinutes(5).build();
+
+        when(ruleRepository.findByClusterIdAndEnabled("cluster-1", true))
+                .thenReturn(List.of(lagRule, connRule));
+        when(ruleRepository.saveAll(anyList())).thenReturn(List.of(lagRule, connRule));
+        when(alertRepository.saveAll(anyList())).thenAnswer(inv -> inv.getArgument(0));
+
+        List<Alert> alerts = alertEngineService.evaluateRules("cluster-1", degradedSnapshot);
+
+        assertEquals(2, alerts.size());
+        // Both rules and alerts persisted in exactly one saveAll each
+        verify(ruleRepository, times(1)).saveAll(anyList());
+        verify(alertRepository, times(1)).saveAll(anyList());
     }
 
     @Test
@@ -217,5 +218,20 @@ class AlertEngineServiceTest {
         assertEquals(Alert.AlertStatus.ACKNOWLEDGED, result.getStatus());
         assertEquals("jaspreet", result.getAcknowledgedBy());
         assertNotNull(result.getAcknowledgedAt());
+        // acknowledge still uses individual save (single record update)
+        verify(alertRepository, times(1)).save(any(Alert.class));
+    }
+
+    // --- helper ---
+
+    private AlertRule lagRule(String id, double threshold, AlertRule.Severity severity) {
+        return AlertRule.builder()
+                .id(id).clusterId("cluster-1")
+                .ruleName("High Replication Lag")
+                .metricType(AlertRule.MetricType.REPLICATION_LAG_MS)
+                .comparator(AlertRule.Comparator.GREATER_THAN)
+                .threshold(threshold).severity(severity)
+                .enabled(true).cooldownMinutes(5)
+                .build();
     }
 }
