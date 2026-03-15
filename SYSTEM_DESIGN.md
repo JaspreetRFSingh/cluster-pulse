@@ -16,6 +16,7 @@
 12. [Failure Modes and Resilience](#12-failure-modes-and-resilience)
 13. [Configuration Reference](#13-configuration-reference)
 14. [Scalability Considerations](#14-scalability-considerations)
+15. [Performance Optimizations (Dec 2025 – Feb 2026)](#15-performance-optimizations-dec-2025--feb-2026)
 
 ---
 
@@ -111,14 +112,15 @@ Controllers are thin — they delegate all logic to the service layer and return
 | Service | Responsibility |
 |---|---|
 | `ClusterRegistryService` | CRUD for registered cluster metadata; duplicate URI detection; status updates |
-| `HealthPollerService` | Opens a short-lived `MongoClient` per cluster, runs `replSetGetStatus` + `serverStatus`, parses the response, and saves a `HealthSnapshot` |
-| `AlertEngineService` | Loads enabled rules per cluster, evaluates each metric value against its threshold and comparator, respects cooldown windows, and persists fired `Alert` records |
+| `HealthPollerService` | Opens a short-lived `MongoClient` per cluster, runs `replSetGetStatus` + `serverStatus`, parses the response, and saves a `HealthSnapshot`. `MongoClientSettings` are cached per URI to avoid redundant object construction on every poll. |
+| `AlertEngineService` | Loads enabled rules per cluster, evaluates each metric value against its threshold and comparator, respects cooldown windows. Fired alerts and rule timestamps are batched into a single `saveAll()` each, reducing MongoDB write round-trips from 2N to 2. |
 | `RemediationService` | Filters critical-severity alerts, determines the appropriate action per metric type, and executes (or dry-runs) the action against the target cluster |
 | `IncidentService` | Groups alerts into incidents, manages lifecycle transitions (OPEN → INVESTIGATING → MITIGATING → RESOLVED), maintains timeline entries for audit |
+| `SnapshotRetentionService` | Runs hourly. Deletes `health_snapshots` older than the configured retention window (default 72 h) for each registered cluster. Isolates failures per-cluster so one bad cleanup does not abort the others. |
 
 ### 4.3 Scheduler
 
-`HealthCheckScheduler` runs on a `ThreadPoolTaskScheduler` (4 threads) via Spring's `@Scheduled`. Each tick it iterates all registered clusters and calls the pipeline steps sequentially per cluster. The `fixedDelay` semantics mean the 30-second interval starts *after* the previous cycle finishes — this prevents pile-up if polling a large number of clusters takes longer than expected.
+`HealthCheckScheduler` runs on a `ThreadPoolTaskScheduler` (4 threads) via Spring's `@Scheduled`. Each tick it submits one `CompletableFuture` per registered cluster to a dedicated `clusterPollExecutor` (core=8, max=16) and awaits all with a 60-second cap. Clusters are therefore polled **in parallel** — a slow or unreachable cluster no longer delays healthy ones. The `fixedDelay` semantics mean the 30-second interval starts *after* the previous cycle finishes, preventing pile-up if aggregate polling time grows.
 
 ### 4.4 Configuration
 
@@ -131,15 +133,16 @@ Controllers are thin — they delegate all logic to the service layer and return
 
 ## 5. Core Pipeline: Health Check Cycle
 
-Triggered every 30 seconds per the scheduler. The full pipeline for a single cluster:
+Triggered every 30 seconds per the scheduler. Clusters are processed **in parallel** — one `CompletableFuture` per cluster submitted to `clusterPollExecutor`. The full pipeline for a single cluster:
 
 ```
 HealthCheckScheduler.runHealthCheckCycle()
   │
-  └─ for each registered Cluster:
+  └─ CompletableFuture per Cluster (parallel, timeout=60s):
        │
        ├─ 1. POLL
        │     HealthPollerService.pollCluster(cluster)
+       │       ├─ getOrBuildSettings(uri)  → ConcurrentHashMap cache, built once per URI
        │       ├─ open MongoClient (5s connect timeout, 10s read timeout)
        │       ├─ run replSetGetStatus   → parse member states, replication lag
        │       ├─ run serverStatus       → parse connections, opcounters
@@ -153,13 +156,15 @@ HealthCheckScheduler.runHealthCheckCycle()
        │
        ├─ 3. EVALUATE ALERTS
        │     AlertEngineService.evaluateRules(clusterId, snapshot)
-       │       ├─ load enabled AlertRules for cluster
+       │       ├─ early exit if no enabled rules
        │       ├─ for each rule:
        │       │    ├─ skip if in cooldown (lastFiredAt + cooldownMinutes > now)
        │       │    ├─ extract metric value from snapshot
        │       │    ├─ evaluate: actual  <comparator>  threshold
-       │       │    └─ if breached → save Alert, update rule.lastFiredAt
-       │       └─ return list of fired Alert records
+       │       │    └─ if breached → collect rule + build Alert (no save yet)
+       │       ├─ ruleRepository.saveAll(firedRules)   ← 1 round-trip
+       │       ├─ alertRepository.saveAll(toFire)       ← 1 round-trip
+       │       └─ return saved Alert list
        │
        └─ 4. REMEDIATE (if any alerts fired)
              RemediationService.evaluateAndRemediate(cluster, alerts)
@@ -452,7 +457,7 @@ Handled errors: `ClusterNotFoundException (404)`, `ClusterUnreachableException (
 
 ### Snapshot Retention
 
-Snapshots older than 72 hours (configurable via `clusterpulse.health.snapshot-retention-hours`) are eligible for cleanup via `HealthSnapshotRepository.deleteByClusterIdAndCapturedAtBefore()`. This must be called by a scheduled cleanup job (not yet implemented; currently queries are bounded by `hours` and `limit` query parameters on the history endpoint).
+`SnapshotRetentionService` runs hourly (configurable via `clusterpulse.health.retention-cleanup-interval-ms`) and calls `HealthSnapshotRepository.deleteByClusterIdAndCapturedAtBefore()` for each registered cluster with a cutoff of `now - retentionHours`. Default retention is 72 hours. Failures on individual clusters are caught and logged — the cleanup loop continues for remaining clusters.
 
 ### Query Patterns
 
@@ -467,23 +472,31 @@ Snapshots older than 72 hours (configurable via `clusterpulse.health.snapshot-re
 
 ## 11. Threading and Concurrency
 
-### Scheduler Thread Pool
+### Thread Pools
 
-The `ThreadPoolTaskScheduler` is configured with **4 threads**, named `health-poller-1` through `health-poller-4`. All scheduled tasks share this pool.
+Two separate pools keep scheduling and polling concerns isolated:
 
-Because `HealthCheckScheduler` uses `@Scheduled(fixedDelay = ...)`, only one health check cycle runs at a time — the next tick does not start until the current one completes. With 4 threads in the pool, this leaves headroom for other `@Scheduled` tasks (e.g., future cleanup jobs) without contention.
+| Pool | Bean | Size | Thread prefix | Purpose |
+|---|---|---|---|---|
+| Scheduler | `ThreadPoolTaskScheduler` | 4 | `health-poller-` | Drives `@Scheduled` ticks for `HealthCheckScheduler` and `SnapshotRetentionService` |
+| Poll executor | `ThreadPoolTaskExecutor` (`clusterPollExecutor`) | core=8, max=16, queue=50 | `cluster-poll-` | Executes `processCluster()` calls in parallel within each health check cycle |
 
-### Per-Cluster Isolation
+### Parallel Cluster Polling
 
-Each cluster is processed sequentially inside the same tick. If polling Cluster A hangs (e.g., DNS timeout), it delays Cluster B in the same cycle. The poller enforces a 5-second connect timeout and 10-second read timeout to bound the worst case per cluster.
+`runHealthCheckCycle()` fans out one `CompletableFuture.runAsync()` per registered cluster to `clusterPollExecutor`, then blocks with `allOf(...).get(60, TimeUnit.SECONDS)` before the next `fixedDelay` tick can start.
 
-A natural extension would be to run `processCluster()` calls in parallel using the pool (submit each cluster as a `Future` and await), which would reduce total cycle time from `O(n * pollTime)` to `O(pollTime)`.
+This reduces total cycle time from `O(n × maxPollTime)` to `O(maxPollTime)` — the slowest single cluster now determines cycle duration rather than the sum of all cluster durations.
+
+### Per-Cluster Fault Isolation
+
+Each `CompletableFuture` wraps `processCluster()` in a try-catch, so an exception in one cluster's task does not cancel the others. The 5-second connect timeout and 10-second read timeout on each `MongoClient` bound the worst-case contribution of any single cluster to the 60-second overall cap.
 
 ### Thread Safety
 
-All service beans are Spring singletons. The only shared mutable state is:
-- `AlertRule.lastFiredAt` — updated on each fire. Under concurrent access (if parallel cluster processing were added), this would require optimistic locking or an atomic update.
-- MongoDB writes — safe because each write goes through the repository layer which uses the thread-safe `MongoTemplate`.
+All service beans are Spring singletons. Shared mutable state:
+- `AlertRule.lastFiredAt` — set inside `evaluateRules()` before the `saveAll()` batch flush. Two clusters could theoretically share a rule (different clusters can have rules with the same ID via copy), but in practice rules are cluster-scoped. No optimistic locking is added currently.
+- `HealthPollerService.settingsCache` — `ConcurrentHashMap` with `computeIfAbsent`, safe for concurrent reads from multiple `cluster-poll-*` threads.
+- MongoDB writes — safe; all writes go through `MongoTemplate` which is thread-safe.
 
 ---
 
@@ -494,7 +507,7 @@ All service beans are Spring singletons. The only shared mutable state is:
 If a poll fails for any reason (network timeout, auth failure, wrong URI), the poller catches the exception and saves an `UNREACHABLE` snapshot. This means:
 - The cluster status is immediately updated to `UNREACHABLE` in the registry
 - Alert rules referencing metrics like `VOTING_MEMBERS_DOWN` can still fire on the snapshot (with default/zero values)
-- The health check cycle continues to the next cluster — one unreachable cluster does not abort the cycle
+- Because polling is now parallel, one unreachable cluster does not delay healthy ones in the same cycle
 
 ### ClusterPulse's Own MongoDB Unavailable
 
@@ -541,16 +554,60 @@ clusterpulse:
 
 ### Current Design (Single Instance)
 
-ClusterPulse runs as a single Spring Boot process. This is sufficient for monitoring tens of clusters, given that each poll is a fast admin command taking < 1 second against a healthy cluster.
+ClusterPulse runs as a single Spring Boot process. Polling is parallel within each cycle, so it scales to tens of clusters comfortably within the default 30-second interval.
 
-### Horizontal Scaling Bottlenecks
+### Remaining Horizontal Scaling Bottlenecks
 
 If the number of clusters grows to hundreds:
 
-1. **Sequential polling** — the current loop processes clusters one at a time. Moving to parallel execution (a `CompletableFuture` per cluster) with a bounded thread pool would reduce cycle time proportionally.
-2. **Single scheduler** — with multiple ClusterPulse instances, each would attempt to poll all clusters, causing duplicate snapshots and double-firing alerts. A distributed lock (e.g., via MongoDB's `findAndModify` as a mutex, or Redis `SETNX`) on the cluster ID would allow work-sharding across instances.
-3. **health_snapshots growth** — at 30-second intervals, a single cluster generates ~2,880 snapshots per day. With 72-hour retention and 100 clusters, that is ~864,000 documents. The compound index keeps queries fast, but a TTL index on `capturedAt` would be a cleaner retention mechanism than manual cleanup queries.
+1. **Single scheduler** — with multiple ClusterPulse instances, each would poll all clusters, causing duplicate snapshots and double-firing alerts. A distributed lock (e.g., via MongoDB's `findAndModify` as a mutex, or Redis `SETNX`) keyed on cluster ID would allow work-sharding across instances.
+2. **`clusterPollExecutor` saturation** — the pool cap of 16 threads means > 16 simultaneous clusters will queue. Increasing `maxPoolSize` or sharding clusters across instances addresses this.
+3. **`health_snapshots` growth** — at 30-second intervals, one cluster produces ~2,880 snapshots/day. With 72-hour retention and 100 clusters that is ~864,000 documents. `SnapshotRetentionService` handles cleanup, but a MongoDB TTL index on `capturedAt` would be a more efficient alternative (server-side expiry vs. application-driven deletes).
 
 ### Stateless API Layer
 
-The REST controllers hold no in-memory state. Scaling the API layer horizontally (multiple instances behind a load balancer) requires only that the scheduler not run on API-only nodes — a simple profile separation (`@Profile("scheduler")` on `HealthCheckScheduler`) would achieve this.
+The REST controllers hold no in-memory state. Scaling the API layer horizontally (multiple instances behind a load balancer) requires only that the scheduler not run on API-only nodes — a simple profile separation (`@Profile("scheduler")` on `HealthCheckScheduler` and `SnapshotRetentionService`) would achieve this.
+
+---
+
+## 15. Performance Optimizations (Dec 2025 – Feb 2026)
+
+This section summarises the targeted improvements made after the initial feature-complete build.
+
+### 15.1 Parallel Cluster Polling (Dec 2025)
+
+**Problem:** `HealthCheckScheduler` iterated clusters in a for-loop. A cluster with a slow DNS or firewall timeout blocked every subsequent cluster in the same cycle. With 10 clusters at 5-second connect timeout each, worst case was a 50-second cycle.
+
+**Solution:** Each cluster's `processCluster()` is submitted as a `CompletableFuture.runAsync()` to a dedicated `clusterPollExecutor` bean (`ThreadPoolTaskExecutor`, core=8, max=16). `CompletableFuture.allOf()` waits up to 60 seconds for all tasks.
+
+**Effect:** Cycle time drops from `O(n × maxPollTime)` to `O(maxPollTime)`. 20 clusters at 500 ms average poll time now complete in ~500 ms instead of ~10 seconds.
+
+---
+
+### 15.2 Snapshot Retention Enforcement (Dec 2025)
+
+**Problem:** `HealthSnapshotRepository.deleteByClusterIdAndCapturedAtBefore()` was defined but never called. The `health_snapshots` collection grew without bound, degrading query performance over time.
+
+**Solution:** `SnapshotRetentionService` runs on an hourly `@Scheduled` tick. For each registered cluster it deletes snapshots whose `capturedAt` is before `now - retentionHours`. Failures are caught per-cluster so a single bad cluster does not abort the full cleanup run.
+
+**Effect:** Collection size is bounded to `nClusters × snapshotsPerHour × retentionHours`. At default settings (30s interval, 72h retention): 120 snapshots/hour × 72h = 8,640 snapshots per cluster maximum.
+
+---
+
+### 15.3 MongoClientSettings Cache (Dec 2025)
+
+**Problem:** `HealthPollerService` rebuilt a `MongoClientSettings` object on every poll tick. This involved parsing the connection string and constructing immutable config objects — unnecessary work given that the URI never changes between polls.
+
+**Solution:** A `ConcurrentHashMap<String, MongoClientSettings>` keyed by connection URI. `computeIfAbsent` ensures the settings are built exactly once per unique URI, with no locking overhead on the hot read path (concurrent polls of different clusters).
+
+**Effect:** Eliminates `n` redundant `ConnectionString` parses per cycle. Thread-safe with no contention given `ConcurrentHashMap` semantics.
+
+---
+
+### 15.4 Batch Alert and Rule Persistence (Jan 2026)
+
+**Problem:** When `k` alert rules fired in a single cycle, `AlertEngineService` issued `k` individual `ruleRepository.save()` calls followed by `k` individual `alertRepository.save()` calls — `2k` synchronous MongoDB round-trips inside a hot parallel task.
+
+**Solution:** The evaluation loop now collects fired rules and built `Alert` objects into two local lists. After the loop, `ruleRepository.saveAll(firedRules)` and `alertRepository.saveAll(toFire)` flush both in exactly 2 round-trips regardless of `k`. An early-exit guard returns immediately when a cluster has no enabled rules.
+
+**Effect:** Reduces per-cycle MongoDB writes from `O(k)` to `O(1)`. For a cluster with 10 firing rules, this cuts 20 round-trips down to 2. Also removes the `fireAlert()` private method, inlining the alert construction for clarity.
